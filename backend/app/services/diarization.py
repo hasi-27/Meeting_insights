@@ -19,7 +19,7 @@ class DiarizationService:
         try:
             self.pipeline = Pipeline.from_pretrained(
                 "pyannote/speaker-diarization-3.1",
-                token=settings.hugging_face_token,
+                use_auth_token=settings.hugging_face_token,
             )
             self.pipeline.to(torch.device(self.device))
         except Exception as e:
