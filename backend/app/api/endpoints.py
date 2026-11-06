@@ -1,10 +1,7 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
-from typing import Optional
-import uuid
-import os
-import asyncio
 
-from app.config import settings
+from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
+import uuid
+
 from app.models import (
     MeetingUploadResponse,
     MeetingResponse,
@@ -14,7 +11,6 @@ from app.models import (
     SpeakerInsight,
 )
 from app.utils.error_handler import handle_error
-from app.utils.validation import validate_transcript_segment
 from app.utils.helpers import (
     merge_transcript_with_speakers,
     format_transcript_for_llm,
@@ -22,39 +18,31 @@ from app.utils.helpers import (
 )
 from app.services.file_handler import FileHandler
 from app.services.transcription import transcription_service
-from app.services.diarization import diarization_service
 from app.services.llm_analysis import llm_service
 from app.services.speaker_stats import speaker_stats_service
 
 router = APIRouter()
 file_handler = FileHandler()
 
-# In-memory storage for meeting states (replace with DB in production)
+# Temporary in-memory storage for meeting records.
 meetings_db = {}
 
 
 @router.post("/meetings/upload", response_model=MeetingUploadResponse)
-async def upload_meeting(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
-    """
-    Upload a meeting recording file.
+async def upload_meeting(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None,
+):
+    """Upload a meeting recording and start processing."""
 
-    Supported formats: MP3, WAV, M4A, MP4
-
-    Returns:
-        MeetingUploadResponse with meeting_id for tracking
-    """
     try:
-        # Validate file
         if not file.filename:
             raise ValueError("No filename provided")
 
-        # Generate unique meeting ID
         meeting_id = str(uuid.uuid4())
 
-        # Save file
         file_path = await file_handler.save_upload(file, meeting_id)
 
-        # Initialize meeting record
         meetings_db[meeting_id] = {
             "meeting_id": meeting_id,
             "filename": file.filename,
@@ -62,15 +50,17 @@ async def upload_meeting(file: UploadFile = File(...), background_tasks: Backgro
             "file_path": file_path,
         }
 
-        # Start background processing
         if background_tasks:
-            background_tasks.add_task(process_meeting_background, meeting_id)
+            background_tasks.add_task(
+                process_meeting_background, meeting_id
+            )
         else:
-            # If no background tasks, start async processing
-            asyncio.create_task(process_meeting_background(meeting_id))
+            raise RuntimeError("Background task manager unavailable")
 
         return MeetingUploadResponse(
-            meeting_id=meeting_id, filename=file.filename, status="processing"
+            meeting_id=meeting_id,
+            filename=file.filename,
+            status="processing",
         )
 
     except Exception as e:
@@ -79,18 +69,17 @@ async def upload_meeting(file: UploadFile = File(...), background_tasks: Backgro
 
 @router.get("/meetings/{meeting_id}", response_model=MeetingResponse)
 async def get_meeting(meeting_id: str):
-    """
-    Get the results of a processed meeting.
+    """Retrieve meeting processing status and results."""
 
-    Returns current processing status or completed results.
-    """
     try:
-        if meeting_id not in meetings_db:
-            raise ValueError(f"Meeting {meeting_id} not found")
+        meeting = meetings_db.get(meeting_id)
 
-        meeting = meetings_db[meeting_id]
+        if meeting is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Meeting {meeting_id} not found",
+            )
 
-        # Build response with all available data
         response_data = {
             "meeting_id": meeting_id,
             "filename": meeting["filename"],
@@ -107,123 +96,171 @@ async def get_meeting(meeting_id: str):
 
         return MeetingResponse(**response_data)
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise handle_error(e, "Failed to retrieve meeting")
 
 
 @router.post("/meetings/{meeting_id}/process")
-async def process_meeting_endpoint(meeting_id: str, background_tasks: BackgroundTasks):
-    """
-    Trigger processing of an uploaded meeting.
+async def process_meeting_endpoint(
+    meeting_id: str,
+    background_tasks: BackgroundTasks,
+):
+    """Manually trigger meeting processing."""
 
-    This endpoint manually triggers the processing pipeline.
-    """
     try:
-        if meeting_id not in meetings_db:
-            raise ValueError(f"Meeting {meeting_id} not found")
+        meeting = meetings_db.get(meeting_id)
 
-        meeting = meetings_db[meeting_id]
+        if meeting is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Meeting {meeting_id} not found",
+            )
 
         if meeting["status"] != "processing":
-            return {"status": meeting["status"], "meeting_id": meeting_id}
+            return {
+                "status": meeting["status"],
+                "meeting_id": meeting_id,
+            }
 
-        # Start processing
-        background_tasks.add_task(process_meeting_background, meeting_id)
+        background_tasks.add_task(
+            process_meeting_background, meeting_id
+        )
 
-        return {"status": "processing", "meeting_id": meeting_id}
+        return {
+            "status": "processing",
+            "meeting_id": meeting_id,
+        }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise handle_error(e, "Failed to start processing")
 
 
 async def process_meeting_background(meeting_id: str):
     """
-    Background processing pipeline for meeting analysis.
-
-    Runs: Transcription → Diarization → Merge → LLM Analysis → Statistics
+    Pipeline:
+    Gemini Transcription + Diarization
+    → Transcript formatting
+    → Gemini LLM analysis
+    → Speaker statistics
     """
+
     try:
-        meeting = meetings_db[meeting_id]
+        meeting = meetings_db.get(meeting_id)
+
+        if meeting is None:
+            raise ValueError(f"Meeting {meeting_id} not found")
+
         file_path = meeting["file_path"]
 
-        # Step 1: Transcription
-        print(f"[{meeting_id}] Starting transcription...")
-        trans_result = await transcription_service.transcribe(file_path)
+        # Step 1: Transcription and speaker diarization
+        # Gemini provides text, speaker labels and timestamps.
+        print(f"[{meeting_id}] Starting Gemini transcription...")
+
+        trans_result = await transcription_service.transcribe(
+            file_path
+        )
 
         if trans_result["status"] != "success":
             raise ValueError(
-                f"Transcription failed: {trans_result.get('error', 'Unknown error')}"
+                f"Transcription failed: "
+                f"{trans_result.get('error', 'Unknown error')}"
             )
 
-        transcript_segments = trans_result["segments"]
-        transcript_text = trans_result["text"]
+        transcript_segments = trans_result.get("segments", [])
+        transcript_text = trans_result.get("text", "")
 
-        # Step 2: Speaker Diarization
-        print(f"[{meeting_id}] Starting speaker diarization...")
-        diar_result = await diarization_service.diarize(file_path)
-
-        if diar_result["status"] == "error":
-            raise ValueError(f"Diarization failed: {diar_result.get('error')}")
-
-        diarization_segments = diar_result.get("segments", [])
-
-        # Step 3: Merge Transcript with Speakers
-        print(f"[{meeting_id}] Merging transcript with speaker labels...")
-        merged_transcript = merge_transcript_with_speakers(
-            transcript_segments, diarization_segments
+        # Step 2: Use Gemini speaker labels.
+        # No separate pyannote model is loaded.
+        print(
+            f"[{meeting_id}] Using Gemini speaker diarization..."
         )
 
-        # Step 4: Format for LLM
-        transcript_for_llm = format_transcript_for_llm(merged_transcript)
+        diarization_segments = []
 
-        # Step 5: LLM Analysis
-        print(f"[{meeting_id}] Running LLM analysis...")
-        llm_result = await llm_service.analyze_transcript(transcript_for_llm)
+        # Step 3: Merge transcript and speaker information.
+        print(f"[{meeting_id}] Formatting speaker transcript...")
+
+        merged_transcript = merge_transcript_with_speakers(
+            transcript_segments,
+            diarization_segments,
+        )
+
+        # Step 4: Format transcript for LLM.
+        transcript_for_llm = format_transcript_for_llm(
+            merged_transcript
+        )
+
+        # Step 5: Meeting analysis.
+        print(f"[{meeting_id}] Running Gemini meeting analysis...")
+
+        llm_result = await llm_service.analyze_transcript(
+            transcript_for_llm
+        )
 
         if llm_result["status"] != "success":
-            raise ValueError(f"LLM analysis failed: {llm_result.get('error')}")
+            raise ValueError(
+                f"LLM analysis failed: "
+                f"{llm_result.get('error')}"
+            )
 
         analysis = llm_result["analysis"]
 
-        # Step 6: Calculate Speaker Statistics
+        # Step 6: Calculate speaker statistics.
         print(f"[{meeting_id}] Calculating speaker statistics...")
+
         speaker_insights = speaker_stats_service.calculate_stats(
-            merged_transcript, diarization_segments
+            merged_transcript,
+            diarization_segments,
         )
 
-        # Calculate meeting duration
-        duration_seconds = max(
-            estimate_meeting_duration(diarization_segments),
-            estimate_meeting_duration(transcript_segments),
+        # Step 7: Calculate meeting duration.
+        duration_seconds = estimate_meeting_duration(
+            transcript_segments
         )
 
-        # Step 7: Update meeting record
+        # Step 8: Save results in meeting record.
         meetings_db[meeting_id].update({
             "status": "completed",
             "summary": analysis.get("summary"),
             "decisions": [
-                DecisionItem(decision=d["decision"]).model_dump()
+                DecisionItem(
+                    decision=d["decision"]
+                ).model_dump()
                 for d in analysis.get("decisions", [])
             ],
             "action_items": [
                 ActionItem(**item).model_dump()
                 for item in analysis.get("action_items", [])
             ],
-            "open_questions": analysis.get("open_questions", []),
+            "open_questions": analysis.get(
+                "open_questions", []
+            ),
             "speakers": [
-                SpeakerInsight(**speaker).model_dump() for speaker in speaker_insights
+                SpeakerInsight(**speaker).model_dump()
+                for speaker in speaker_insights
             ],
             "transcript": [
-                TranscriptSegment(**segment).model_dump() for segment in merged_transcript
+                TranscriptSegment(**segment).model_dump()
+                for segment in merged_transcript
             ],
             "duration_seconds": duration_seconds,
         })
 
-        print(f"[{meeting_id}] Processing completed successfully")
+        print(
+            f"[{meeting_id}] Processing completed successfully"
+        )
 
     except Exception as e:
         print(f"[{meeting_id}] Processing failed: {str(e)}")
-        meetings_db[meeting_id].update({
-            "status": "failed",
-            "error_message": str(e),
-        })
+
+        meeting = meetings_db.get(meeting_id)
+
+        if meeting is not None:
+            meeting.update({
+                "status": "failed",
+                "error_message": str(e),
+            })
